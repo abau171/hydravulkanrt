@@ -1,0 +1,169 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(push_constant) uniform PushConstants {
+    mat4 ndcToWorld;
+    vec3 cameraOrigin;
+    uint accumulateFrame;
+    int aoRaysPerFrame;
+} pushConstants;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT as;
+layout(set = 0, binding = 1, rgba32f) uniform image2D outputImage;
+layout(set = 0, binding = 2, rgba16f) uniform image2D inputAlbedo;
+layout(set = 0, binding = 3, rgba32f) uniform image2D inputWorldPosition;
+layout(set = 0, binding = 4, rgba16f) uniform image2D inputWorldNormal;
+
+struct Light {
+    vec4 v_directional;
+    vec4 intensity_raytraced;
+};
+layout(set = 0, binding = 5) uniform LightData {
+    ivec4 numLights_padding;
+    vec4 ambientLightIntensity_maxDistance;
+    Light lights[10];
+} lightData;
+
+layout(location = 0) rayPayloadEXT float hitDistance;
+
+const float inf = 1.0f / 0.0f;
+
+uint pcgState;
+
+void pcgStep() {
+    pcgState = pcgState * 747796405u + 2891336453u;
+}
+
+uint randu() {
+    uint oldState = pcgState;
+    pcgStep();
+    uint word = ((oldState >> ((oldState >> 28u) + 4u)) ^ oldState) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float randf() {
+    return float(randu()) / 4294967808.0f;
+}
+
+void rseed() {
+    // XXX: Pretty lame initialization...
+    pcgState =
+        (gl_LaunchIDEXT.x << 18u)
+        ^ (gl_LaunchIDEXT.y << 4u)
+        ^ pushConstants.accumulateFrame;
+    pcgState ^=
+        (pushConstants.accumulateFrame << 28)
+        ^ (gl_LaunchIDEXT.y << 14u)
+        ^ gl_LaunchIDEXT.x;
+    pcgStep();
+}
+
+const float TWO_PI = 6.28318530718f;
+
+vec3 sampleSphere() {
+    float phi = TWO_PI * randf();
+    float cosTheta = randf();
+    float sinTheta = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta));
+    return vec3(
+        sinTheta * cos(phi),
+        sinTheta * sin(phi),
+        cosTheta);
+}
+
+vec3 sampleCosineHemisphere() {
+    float phi = TWO_PI * randf();
+    float cosTheta = sqrt(randf());
+    float sinTheta = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta));
+    return vec3(
+        sinTheta * cos(phi),
+        sinTheta * sin(phi),
+        cosTheta);
+}
+
+mat3 makeBasis(vec3 normal) {
+    vec3 tangent1 = normalize(cross(normal, vec3(1, 2, 3)));
+    vec3 tangent2 = normalize(cross(tangent1, normal));
+    return mat3(tangent2, tangent1, normal);
+}
+
+bool occluded(vec3 position, vec3 direction, float maxDistance) {
+
+    hitDistance = maxDistance;
+    traceRayEXT(
+        as,
+        gl_RayFlagsOpaqueEXT,
+        0xff,
+        0,
+        0,
+        0,
+        position,
+        0.0001f,
+        direction,
+        maxDistance,
+        0);
+
+    return (hitDistance < maxDistance);
+}
+
+void main() {
+
+    rseed();
+
+    vec3 cameraOrigin = pushConstants.cameraOrigin;
+    ivec2 imageCoords = ivec2(gl_LaunchIDEXT.xy);
+    vec3 albedo = imageLoad(inputAlbedo, imageCoords).rgb;
+    vec3 position = imageLoad(inputWorldPosition, imageCoords).xyz;
+    vec3 normal = imageLoad(inputWorldNormal, imageCoords).xyz;
+
+    mat3 surfaceToWorld = makeBasis(normal);
+
+    vec3 outColor;
+    if (normal == vec3(0.0f)) {
+
+        outColor = vec3(0.0f);
+
+    } else {
+
+        vec3 lighting = vec3(0.0f);
+
+        // Ambient lighting.
+        float occludedCount = 0.0f;
+        const float ambientLightMaxDistance = lightData.ambientLightIntensity_maxDistance.w;
+        for (int i = 0; i < pushConstants.aoRaysPerFrame; i++) {
+            vec3 sampleDirection = surfaceToWorld * sampleCosineHemisphere();
+            if (occluded(position, sampleDirection, ambientLightMaxDistance)) {
+                occludedCount += 1.0f;
+            }
+        }
+        lighting +=
+            lightData.ambientLightIntensity_maxDistance.rgb
+            * vec3(1.0f - occludedCount / float(pushConstants.aoRaysPerFrame));
+
+        // Other lighting.
+        // TODO: Point light if !lightData.lights[i].v_directional.w.
+        for (int i = 0; i < lightData.numLights_padding.x; i++) {
+
+            vec3 lightDir = lightData.lights[i].v_directional.xyz;
+
+            float nDotL = dot(normal, lightDir);
+            if (nDotL <= 0.0f) continue;
+
+            bool raytraced = (lightData.lights[i].intensity_raytraced.w != 0.0f);
+            if (raytraced && occluded(position, lightDir, inf)) {
+                continue;
+            }
+
+            lighting += lightData.lights[i].intensity_raytraced.rgb * nDotL;
+        }
+
+        outColor = albedo * lighting;
+    }
+
+    if (pushConstants.accumulateFrame > 0) {
+        vec3 curColor = imageLoad(outputImage, imageCoords).rgb;
+        outColor =
+            (curColor * (pushConstants.accumulateFrame - 1.0f) + outColor)
+            / pushConstants.accumulateFrame;
+    }
+    imageStore(outputImage, imageCoords, vec4(outColor, 1.0f));
+}

@@ -1,0 +1,20 @@
+{
+    "Plugins": [
+        {
+            "Type": "library",
+            "Name": "HydraVulkanRT",
+            "LibraryPath": "libHydraVulkanRT.so",
+            "Info": {
+                "Types": {
+                    "HVRTRenderPlugin": {
+                        "bases": [
+                            "HdRendererPlugin"
+                        ],
+                        "displayName": "HydraVulkanRT",
+                        "priority": 99
+                    }
+                }
+            }
+        }
+    ]
+}
